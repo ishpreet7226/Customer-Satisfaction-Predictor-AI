@@ -1,5 +1,0 @@
-Model,Accuracy,Precision,Recall,F1,ROC_AUC,CV_F1,CV_F1_Std,Train_Time_s,Is_Best
-Logistic Regression,0.8,0.8042,0.8,0.799,0.855,0.7766,0.0261,0.04,True
-Random Forest,0.7962,0.8009,0.7962,0.7951,0.8641,0.79,0.0292,0.31,False
-XGBoost,0.7769,0.779,0.7769,0.7763,0.841,0.7825,0.0254,1.16,False
-LightGBM,0.7654,0.7656,0.7654,0.7652,0.8317,0.7709,0.033,0.57,False
