@@ -1,9 +1,8 @@
-# Lambda deployment requirements
-# Build: pip install -r requirements.txt -t ./package --platform manylinux2014_x86_64 --only-binary=:all:
-# Then: cp lambda_function.py phase5_best_model.pkl ./package/ && cd package && zip -r9 ../lambda.zip .
-
-numpy==1.26.4
-scipy==1.13.1
-scikit-learn==1.5.2
-xgboost==2.1.4
+# Lambda deployment dependencies (minimal — no spaCy/NLTK)
 vaderSentiment==3.3.2
+numpy==1.26.4
+scipy==1.12.0
+scikit-learn==1.4.2
+xgboost==2.0.3
+pandas==2.2.2
+boto3>=1.34.0          # S3 model download + DynamoDB logging + Bedrock GenAI

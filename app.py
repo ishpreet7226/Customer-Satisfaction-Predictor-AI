@@ -2,13 +2,46 @@
 AI-Powered Customer Satisfaction Predictor
 Streamlit Dashboard · app.py
 """
-import re, string, pickle, warnings
+import re, string, pickle, warnings, uuid, datetime
 import numpy as np
 import streamlit as st
 from scipy.sparse import hstack, csr_matrix
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from bedrock_genai import generate_ai_recommendation
 
 warnings.filterwarnings('ignore')
+
+# ─── DynamoDB logging helper ─────────────────────────────────────────────────
+@st.cache_resource
+def _get_dynamo():
+    """Return a DynamoDB table resource (None if AWS not configured)."""
+    try:
+        import boto3
+        ddb = boto3.resource('dynamodb', region_name='us-east-1')
+        table = ddb.Table('customer-satisfaction-predictions')
+        table.load()          # will raise if table doesn't exist / no creds
+        return table
+    except Exception:
+        return None
+
+def log_prediction(review, out):
+    """Log prediction to DynamoDB (silently skips if not configured)."""
+    table = _get_dynamo()
+    if table is None:
+        return
+    try:
+        table.put_item(Item={
+            'prediction_id':  str(uuid.uuid4()),
+            'timestamp':      datetime.datetime.utcnow().isoformat(),
+            'review_snippet': review[:200],
+            'sentiment_label': out['vader_label'],
+            'sentiment_score': str(round(out['sentiment_score'], 4)),
+            'predicted_satisfaction': 'Satisfied' if out['satisfied'] else 'Not Satisfied',
+            'confidence':     str(round(out['confidence'], 4)),
+            'topic':          out['topic'],
+        })
+    except Exception:
+        pass
 
 # ─── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -113,6 +146,36 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .prio-HIGH     { color: #fb923c !important; }
 .prio-MEDIUM   { color: #fbbf24 !important; }
 .prio-LOW      { color: #34d399 !important; }
+
+/* GenAI card */
+.genai-card {
+    background: linear-gradient(135deg, rgba(16,185,129,0.10), rgba(5,150,105,0.07));
+    border: 1px solid rgba(16,185,129,0.30);
+    border-radius: 16px;
+    padding: 1.4rem 1.6rem;
+    margin-top: 1rem;
+    position: relative;
+}
+.genai-badge {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    background: rgba(16,185,129,0.15); border: 1px solid rgba(16,185,129,0.35);
+    border-radius: 999px; padding: 0.2rem 0.7rem;
+    font-size: 0.72rem; font-weight: 700; color: #34d399;
+    letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 0.7rem;
+}
+.genai-text { font-size: 0.97rem; color: #e2e8f0; line-height: 1.65; }
+.genai-source { font-size: 0.72rem; color: #475569; margin-top: 0.6rem; }
+
+/* Sidebar infra pills */
+.infra-pill {
+    display: flex; align-items: center; justify-content: space-between;
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px; padding: 0.45rem 0.9rem; margin-bottom: 0.4rem;
+    font-size: 0.8rem;
+}
+.infra-label { color: #94a3b8; }
+.infra-status-ok   { color: #34d399; font-weight: 700; }
+.infra-status-warn { color: #fbbf24; font-weight: 700; }
 
 /* Textarea */
 textarea { background: rgba(255,255,255,0.05) !important;
@@ -336,129 +399,103 @@ def score_bar(value: float, color: str, width_pct: float) -> str:
 st.markdown("""
 <div class="hero">
   <h1>✈️ AI-Powered Customer Satisfaction Predictor</h1>
-  <p>British Airways Review Analysis · Sentiment · Topic Detection · Recommendations</p>
+  <p>British Airways Review Analysis · VADER Sentiment · XGBoost Prediction · Amazon Bedrock GenAI</p>
 </div>
 """, unsafe_allow_html=True)
 
-col_input, col_results = st.columns([1, 1.2], gap="large")
+# ─── Tabs ─────────────────────────────────────────────────────────────────────
+tab_main, tab_arch = st.tabs(["🔍 Review Analyser", "🏗️ Architecture"])
 
-with col_input:
-    st.markdown("#### 📝 Enter Customer Review")
-    review = st.text_area(
-        label="review",
-        label_visibility="collapsed",
-        placeholder="Paste a British Airways review here…\n\nExample: 'The cabin crew were extremely rude and unhelpful. Our flight was delayed by 3 hours with no explanation.'",
-        height=220,
-        key="review_input",
-    )
+with tab_arch:
+    st.markdown("### AWS System Architecture")
+    try:
+        st.image('architecture_diagram.png', use_container_width=True,
+                 caption='AI-Driven Customer Satisfaction Predictor — AWS Architecture')
+    except Exception:
+        st.info("architecture_diagram.png not found in project root.")
+    st.markdown("""
+    | Layer | AWS Service | Purpose |
+    |-------|------------|--------|
+    | Storage | **Amazon S3** | Model artifact storage (`phase5_best_model.pkl`) |
+    | Compute | **AWS Lambda** (Python 3.12) | Serverless inference API |
+    | API | **Amazon API Gateway** | REST endpoint with CORS |
+    | Database | **Amazon DynamoDB** | Real-time prediction logging |
+    | AI/ML | **XGBoost via SageMaker** | Satisfaction classification (F1=0.989) |
+    | NLP | **VADER + DistilBERT** | Sentiment analysis |
+    | GenAI | **Amazon Bedrock (Claude 3 Haiku)** | Personalised recommendation generation |
+    | Dashboard | **Streamlit** | Real-time visualisation |
+    """)
 
-    st.markdown("")
-    run = st.button("🔍 Analyse Review", use_container_width=True)
+with tab_main:
 
-    # Model info
-    st.markdown("---")
-    st.markdown(f"""
-    <div class="model-pill">XGBoost · F1 = {bundle['metrics']['f1']:.4f}</div><br>
-    <span style="font-size:0.78rem;color:#64748b;">
-    Accuracy: {bundle['metrics']['accuracy']:.2%} · AUC: {bundle['metrics']['roc_auc']:.4f}<br>
-    CV F1: {bundle['metrics']['cv_f1']:.4f} ± {bundle['metrics']['cv_std']:.4f}
-    </span>
-    """, unsafe_allow_html=True)
+    col_input, col_results = st.columns([1, 1.2], gap="large")
 
-with col_results:
-    if run and review.strip():
-        with st.spinner("Analysing…"):
-            out = predict(review.strip())
+    with col_input:
+        st.markdown("#### 📝 Enter Customer Review")
+        review = st.text_area(
+            label="review",
+            label_visibility="collapsed",
+            placeholder="Paste a British Airways review here…\n\nExample: The crew were rude and the flight was delayed 3 hours.",
+            height=220,
+            key="review_input",
+        )
+        st.markdown("")
+        run = st.button("🔍 Analyse Review", use_container_width=True)
+        gen_ai = st.checkbox("🤖 Amazon Bedrock GenAI Insight", value=True)
+        st.markdown("---")
+        st.markdown(f'''
+        <div class="model-pill">XGBoost · F1 = {bundle["metrics"]["f1"]:.4f}</div><br>
+        <span style="font-size:0.78rem;color:#64748b;">
+        Accuracy: {bundle["metrics"]["accuracy"]:.2%} · AUC: {bundle["metrics"]["roc_auc"]:.4f}<br>
+        CV F1: {bundle["metrics"]["cv_f1"]:.4f} ± {bundle["metrics"]["cv_std"]:.4f}
+        </span>
+        ''', unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown("<div style='font-size:0.72rem;font-weight:700;text-transform:uppercase;color:#64748b;margin-bottom:.5rem'>☁️ AWS Infrastructure</div>", unsafe_allow_html=True)
+        dynamo_ok = _get_dynamo() is not None
+        for svc, ok in [("Lambda (local)", True),("Amazon Bedrock", True),("DynamoDB", dynamo_ok)]:
+            cls = "infra-status-ok" if ok else "infra-status-warn"
+            st.markdown(f'<div class="infra-pill"><span class="infra-label">{svc}</span><span class="{cls}">● {"Active" if ok else "Not configured"}</span></div>', unsafe_allow_html=True)
 
-        lbl   = out['vader_label']
-        score = out['sentiment_score']
-        sat   = out['satisfied']
-        conf  = out['confidence']
-        topic = out['topic']
-        rec   = out['recommendation']
-
-        # ── Sentiment ──────────────────────────────────────────────────
-        badge_cls = f"badge-{lbl.lower()}"
-        lbl_emoji = {'Positive': '😊', 'Negative': '😞', 'Neutral': '😐'}[lbl]
-        score_pct = (score + 1) / 2 * 100
-        score_color = ('#34d399' if score >= 0.05 else
-                       '#f87171' if score <= -0.05 else '#fbbf24')
-
-        # ── Satisfaction ───────────────────────────────────────────────
-        sat_label = 'Satisfied' if sat else 'Not Satisfied'
-        sat_emoji = '✅' if sat else '❌'
-        sat_color = '#34d399' if sat else '#f87171'
-        conf_pct  = conf * 100
-
-        # ── Priority colour ────────────────────────────────────────────
-        prio = rec['priority']
-        prio_cls = f"prio-{prio}"
-
-        st.markdown("#### 📊 Analysis Results")
-
-        r1c1, r1c2 = st.columns(2)
-        with r1c1:
-            st.markdown(f"""
-            <div class="metric-card">
-              <div class="metric-label">Sentiment</div>
-              <div class="metric-value">{lbl_emoji} {lbl}</div>
-              {score_bar(score, score_color, score_pct)}
-              <div class="metric-sub">VADER compound: <b style="color:{score_color}">{score:+.4f}</b></div>
-            </div>""", unsafe_allow_html=True)
-
-        with r1c2:
-            st.markdown(f"""
-            <div class="metric-card">
-              <div class="metric-label">Predicted Satisfaction</div>
-              <div class="metric-value" style="color:{sat_color}">{sat_emoji} {sat_label}</div>
-              {score_bar(conf, sat_color, conf_pct)}
-              <div class="metric-sub">Model confidence: <b style="color:{sat_color}">{conf_pct:.1f}%</b></div>
-            </div>""", unsafe_allow_html=True)
-
-        st.markdown("<div style='margin-top:0.8rem'></div>", unsafe_allow_html=True)
-
-        r2c1, r2c2 = st.columns(2)
-        with r2c1:
-            st.markdown(f"""
-            <div class="metric-card">
-              <div class="metric-label">Detected Topic</div>
-              <div class="metric-value" style="font-size:1.1rem;color:#a78bfa;">🏷️ {topic}</div>
-              <div class="metric-sub">Matched via keyword extraction</div>
-            </div>""", unsafe_allow_html=True)
-
-        with r2c2:
-            st.markdown(f"""
-            <div class="metric-card">
-              <div class="metric-label">Sentiment Score</div>
-              <div class="metric-value" style="color:{score_color}">{score:+.4f}</div>
-              <div class="metric-sub">Range −1.0 (very negative) → +1.0 (very positive)</div>
-            </div>""", unsafe_allow_html=True)
-
-        # ── Recommendation card ────────────────────────────────────────
-        st.markdown(f"""
-        <div class="rec-card">
-          <div class="rec-title">💡 Service Improvement Recommendation</div>
-          <div class="rec-action">{rec['action']}</div>
-          <div class="rec-meta">
-            <div class="rec-chip">Priority: <span class="{prio_cls}">{prio}</span></div>
-            <div class="rec-chip">Owner: <span>{rec['owner']}</span></div>
-            <div class="rec-chip">KPI: <span>{rec['kpi']}</span></div>
-          </div>
-        </div>""", unsafe_allow_html=True)
-
-    elif run and not review.strip():
-        st.warning("Please enter a review before analysing.")
-    else:
-        st.markdown("""
-        <div style="
-          height: 340px; display:flex; flex-direction:column;
-          align-items:center; justify-content:center;
-          border: 1px dashed rgba(99,102,241,0.25);
-          border-radius: 16px; color: #475569; text-align:center;
-          padding: 2rem;
-        ">
-          <div style="font-size:3rem;margin-bottom:1rem">✈️</div>
-          <div style="font-size:1rem;font-weight:500;color:#64748b">
-            Enter a British Airways review on the left<br>and click <b style="color:#818cf8">Analyse Review</b>
-          </div>
-        </div>""", unsafe_allow_html=True)
+    with col_results:
+        if run and review.strip():
+            with st.spinner("Analysing…"):
+                out = predict(review.strip())
+                log_prediction(review.strip(), out)
+            lbl   = out["vader_label"]
+            score = out["sentiment_score"]
+            sat   = out["satisfied"]
+            conf  = out["confidence"]
+            topic = out["topic"]
+            rec   = out["recommendation"]
+            lbl_emoji = {"Positive": "😊", "Negative": "😞", "Neutral": "😐"}[lbl]
+            score_pct = (score + 1) / 2 * 100
+            score_color = ("#34d399" if score >= 0.05 else "#f87171" if score <= -0.05 else "#fbbf24")
+            sat_label = "Satisfied" if sat else "Not Satisfied"
+            sat_emoji = "✅" if sat else "❌"
+            sat_color = "#34d399" if sat else "#f87171"
+            conf_pct  = conf * 100
+            prio = rec["priority"]
+            prio_cls = f"prio-{prio}"
+            st.markdown("#### 📊 Analysis Results")
+            r1c1, r1c2 = st.columns(2)
+            with r1c1:
+                st.markdown(f'''<div class="metric-card"><div class="metric-label">Sentiment</div><div class="metric-value">{lbl_emoji} {lbl}</div>{score_bar(score, score_color, score_pct)}<div class="metric-sub">VADER compound: <b style="color:{score_color}">{score:+.4f}</b></div></div>''', unsafe_allow_html=True)
+            with r1c2:
+                st.markdown(f'''<div class="metric-card"><div class="metric-label">Predicted Satisfaction</div><div class="metric-value" style="color:{sat_color}">{sat_emoji} {sat_label}</div>{score_bar(conf, sat_color, conf_pct)}<div class="metric-sub">Model confidence: <b style="color:{sat_color}">{conf_pct:.1f}%</b></div></div>''', unsafe_allow_html=True)
+            st.markdown("<div style='margin-top:0.8rem'></div>", unsafe_allow_html=True)
+            r2c1, r2c2 = st.columns(2)
+            with r2c1:
+                st.markdown(f'''<div class="metric-card"><div class="metric-label">Detected Topic</div><div class="metric-value" style="font-size:1.1rem;color:#a78bfa;">🏷️ {topic}</div><div class="metric-sub">Matched via keyword extraction</div></div>''', unsafe_allow_html=True)
+            with r2c2:
+                st.markdown(f'''<div class="metric-card"><div class="metric-label">Sentiment Score</div><div class="metric-value" style="color:{score_color}">{score:+.4f}</div><div class="metric-sub">Range −1.0 → +1.0</div></div>''', unsafe_allow_html=True)
+            st.markdown(f'''<div class="rec-card"><div class="rec-title">💡 Service Improvement</div><div class="rec-action">{rec["action"]}</div><div class="rec-meta"><div class="rec-chip">Priority: <span class="{prio_cls}">{prio}</span></div><div class="rec-chip">Owner: <span>{rec["owner"]}</span></div><div class="rec-chip">KPI: <span>{rec["kpi"]}</span></div></div></div>''', unsafe_allow_html=True)
+            if gen_ai:
+                with st.spinner("🤖 Generating AI insight via Amazon Bedrock…"):
+                    ai_result = generate_ai_recommendation(review=review.strip(), sentiment_label=lbl, sentiment_score=score, satisfaction_label=sat_label, topic=topic, confidence=conf)
+                src = f"Amazon Bedrock · {ai_result['model']} · {ai_result['input_tokens']} in/{ai_result['output_tokens']} out tokens" if ai_result['source'] == 'bedrock' else "Intelligent fallback · Configure AWS credentials for live Bedrock"
+                st.markdown(f'''<div class="genai-card"><div class="genai-badge">🤖 Amazon Bedrock · Generative AI</div><div class="genai-text">{ai_result["ai_recommendation"]}</div><div class="genai-source">{src}</div></div>''', unsafe_allow_html=True)
+        elif run and not review.strip():
+            st.warning("Please enter a review before analysing.")
+        else:
+            st.markdown('''<div style="height:400px;display:flex;flex-direction:column;align-items:center;justify-content:center;border:1px dashed rgba(99,102,241,0.25);border-radius:16px;color:#475569;text-align:center;padding:2rem"><div style="font-size:3rem;margin-bottom:1rem">✈️</div><div style="font-size:1rem;font-weight:500;color:#64748b">Enter a review on the left and click <b style="color:#818cf8">Analyse Review</b><br><span style="font-size:0.85rem;color:#374151;margin-top:.6rem;display:block">🤖 Bedrock GenAI insight auto-generated</span></div></div>''', unsafe_allow_html=True)

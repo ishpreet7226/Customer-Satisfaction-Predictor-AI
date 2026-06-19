@@ -1,0 +1,161 @@
+# AWS SAM Template — Customer Satisfaction Predictor
+# Deploys: Lambda + API Gateway + DynamoDB
+# Usage: sam build && sam deploy --guided
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  AI-Driven Customer Satisfaction Predictor — British Airways
+  NLP sentiment analysis + XGBoost prediction + Amazon Bedrock GenAI + DynamoDB logging
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 512
+    Runtime: python3.12
+    Environment:
+      Variables:
+        AWS_REGION:    !Ref AWS::Region
+        DYNAMO_TABLE:  !Ref PredictionsTable
+        BEDROCK_MODEL: "anthropic.claude-3-haiku-20240307-v1:0"
+        S3_BUCKET:     !Ref ModelBucket
+        S3_KEY:        "phase5_best_model.pkl"
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: API Gateway stage name
+
+Resources:
+
+  # ── S3 — Model artifact storage ──────────────────────────────────────────────
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "ba-satisfaction-model-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── DynamoDB — Prediction log ─────────────────────────────────────────────────
+  PredictionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: customer-satisfaction-predictions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: prediction_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: prediction_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: timestamp-index
+          KeySchema:
+            - AttributeName: timestamp
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ── IAM Role — Lambda execution ───────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ba-satisfaction-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SatisfactionPredictorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 model download
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::ba-satisfaction-model-${AWS::AccountId}/phase5_best_model.pkl"
+              # DynamoDB write
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: !GetAtt PredictionsTable.Arn
+              # Amazon Bedrock invoke
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+
+  # ── Lambda Function ────────────────────────────────────────────────────────────
+  SatisfactionPredictorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: customer-satisfaction-predictor
+      CodeUri: ./
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Description: >
+        Predicts British Airways customer satisfaction from review text using
+        VADER + XGBoost, then generates GenAI recommendations via Amazon Bedrock.
+      Events:
+        PredictApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SatisfactionApi
+            Path: /predict
+            Method: POST
+        HealthApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SatisfactionApi
+            Path: /health
+            Method: GET
+
+  # ── API Gateway ────────────────────────────────────────────────────────────────
+  SatisfactionApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: customer-satisfaction-api
+      StageName: !Ref StageName
+      Cors:
+        AllowMethods: "'POST,GET,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: NONE
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${SatisfactionApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/predict"
+
+  LambdaArn:
+    Description: "Lambda function ARN"
+    Value: !GetAtt SatisfactionPredictorFunction.Arn
+
+  DynamoTableName:
+    Description: "DynamoDB table name"
+    Value: !Ref PredictionsTable
+
+  S3BucketName:
+    Description: "S3 bucket for model artifacts"
+    Value: !Ref ModelBucket
